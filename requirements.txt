@@ -1,9 +1,8 @@
 streamlit
 pillow
-pandas
 numpy
+pandas
 scikit-learn
-timm==0.9.12
-torch==2.0.1
-torchvision==0.15.2
-gdown
+torch==1.13.1
+torchvision==0.14.1
+timm==0.6.13
