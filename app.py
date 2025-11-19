@@ -1,107 +1,102 @@
-"""
-AI Laundry Sorter – Streamlit Demo
-
-- Multitask ConvNeXt model:
-    * Color group prediction
-    * Fabric group prediction
-    * Wash-cycle recommendation
-- Loads the trained checkpoint from Google Drive via gdown
-- Rejects clearly non-clothing images using a confidence-based check
-"""
-
 import os
 import io
 import datetime
 
+import numpy as np
 import pandas as pd
 from PIL import Image
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import transforms
 import timm
-import gdown
 
 import streamlit as st
+import gdown
 
 # --------------------------------------------------
-# 0) Paths and model download (Google Drive)
+# 0) Paths and files
 # --------------------------------------------------
+# این‌ها باید در خود ریپو باشند
+LABELS_CSV = "wash_labels.csv"     # already in repo
+HEADER_IMG = "ai.jpg"              # already in repo
 
-# All files (CSV, header image, log) live in the repo root
-WASH_ROOT   = "."
-LABELS_CSV  = os.path.join(WASH_ROOT, "wash_labels.csv")
-HEADER_IMG  = os.path.join(WASH_ROOT, "ai.jpg")
-DEMO_LOG    = os.path.join(WASH_ROOT, "demo_usage_log.csv")
+# نام فایل مدل روی سرور
+CKPT_PATH = "best_model2_wash.pt"
 
-# Model checkpoint will be downloaded from Google Drive
-MODEL_ID   = "15H1VcNrSRhjMA0eA4XxP6R5WFQwZZDf3"   # <- your shared file ID
-CKPT_PATH  = os.path.join(WASH_ROOT, "best_model2_wash.pt")
+# لینک مستقیم مدل روی گوگل‌درایو
+# (از لینک: https://drive.google.com/file/d/15H1VcNrSRhjMA0eA4XxP6R5WFQwZZDf3/view?usp=drive_link)
+MODEL_URL = "https://drive.google.com/uc?id=15H1VcNrSRhjMA0eA4XxP6R5WFQwZZDf3"
 
+# اگر مدل روی سرور نبود، دانلودش کن
 if not os.path.exists(CKPT_PATH):
-    # Download the model only once; subsequent runs reuse the local file
-    url = f"https://drive.google.com/uc?id={MODEL_ID}"
-    print(f"[INFO] Downloading model checkpoint from Google Drive: {url}")
-    gdown.download(url, CKPT_PATH, quiet=False)
-else:
-    print(f"[INFO] Using existing local checkpoint: {CKPT_PATH}")
+    gdown.download(MODEL_URL, CKPT_PATH, quiet=False)
 
 # --------------------------------------------------
-# 1) Label metadata
+# 1) Load label metadata
 # --------------------------------------------------
-
 df_all = pd.read_csv(LABELS_CSV)
 
-df_all["color_label"]      = df_all["color_label"].astype(int)
-df_all["fabric_label"]     = df_all["fabric_label"].astype(int)
+df_all["color_label"] = df_all["color_label"].astype(int)
+df_all["fabric_label"] = df_all["fabric_label"].astype(int)
 df_all["wash_cycle_label"] = df_all["wash_cycle_label"].astype(int)
 
-num_color_classes  = df_all["color_label"].nunique()
+num_color_classes = df_all["color_label"].nunique()
 num_fabric_classes = df_all["fabric_label"].nunique()
-num_wash_classes   = df_all["wash_cycle_label"].nunique()
+num_wash_classes = df_all["wash_cycle_label"].nunique()
 
-# Simple integer → string maps (consistent with training)
-color_map  = df_all.drop_duplicates("color_label").set_index("color_label")["color_group"].to_dict()
-fabric_map = df_all.drop_duplicates("fabric_label").set_index("fabric_label")["fabric_group"].to_dict()
-wash_map   = df_all.drop_duplicates("wash_cycle_label").set_index("wash_cycle_label")["wash_cycle"].to_dict()
+# map از عدد به اسم کلاس
+color_map = (
+    df_all[["color_label", "color_group"]]
+    .drop_duplicates("color_label")
+    .set_index("color_label")["color_group"]
+    .to_dict()
+)
 
-# Full descriptive wash-cycle names for the UI
+fabric_map = (
+    df_all[["fabric_label", "fabric_group"]]
+    .drop_duplicates("fabric_label")
+    .set_index("fabric_label")["fabric_group"]
+    .to_dict()
+)
+
+wash_map = (
+    df_all[["wash_cycle_label", "wash_cycle"]]
+    .drop_duplicates("wash_cycle_label")
+    .set_index("wash_cycle_label")["wash_cycle"]
+    .to_dict()
+)
+
+# توضیح کامل برنامه‌ی شستشو
 wash_full_description = {
-    "delicate": "Delicate – Gentle wash, cold water, low spin (ideal for silk, lace, and sensitive fabrics).",
-    "normal":   "Normal – Standard wash, 40°C warm water, medium spin (suitable for cotton and everyday garments).",
-    "heavy":    "Heavy – Intensive wash, 60°C hot water, high spin (good for jeans, towels, and sportswear).",
-    "quick":    "Quick – Rapid cycle, 30°C cool water, medium spin (for lightly soiled clothes and quick refresh).",
-    "wool":     "Wool – Special wool cycle, 30°C cold, ultra-low spin (helps prevent shrinkage and fiber damage).",
+    "delicate": (
+        "Delicate – Gentle wash, cold water, low spin "
+        "(ideal for silk, lace, and sensitive fabrics)."
+    ),
+    "normal": (
+        "Normal – Standard wash, 40°C warm water, medium spin "
+        "(suitable for cotton and everyday clothes)."
+    ),
+    "heavy": (
+        "Heavy – Deep clean, 60°C hot water, high spin "
+        "(good for jeans, towels, and sportswear)."
+    ),
+    "quick": (
+        "Quick – Rapid wash, 30°C cool water, medium spin "
+        "(for lightly-soiled garments)."
+    ),
+    "wool": (
+        "Wool – Special wool cycle, 30°C cold water, ultra-low spin "
+        "(prevents shrinkage and protects fibers)."
+    ),
 }
 
 # --------------------------------------------------
-# 2) Model + transforms
+# 2) Model definition (must match training)
 # --------------------------------------------------
-
-IMG_SIZE = 256
-demo_transform = transforms.Compose([
-    transforms.Resize(IMG_SIZE + 32),
-    transforms.CenterCrop(IMG_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        [0.485, 0.456, 0.406],
-        [0.229, 0.224, 0.225],
-    ),
-])
-
 BACKBONE_NAME = "convnext_tiny"
 
 
 class WashMultiTaskConvNeXt(nn.Module):
-    """
-    Multitask ConvNeXt model for:
-      - Color group prediction
-      - Fabric group prediction
-      - Wash-cycle prediction
-
-    The architecture must match the one used during training.
-    """
     def __init__(self, num_color, num_fabric, num_wash):
         super().__init__()
         self.backbone = timm.create_model(
@@ -112,19 +107,20 @@ class WashMultiTaskConvNeXt(nn.Module):
         )
         feat_dim = self.backbone.num_features
 
-        self.head_color      = nn.Linear(feat_dim, num_color)
-        self.head_fabric     = nn.Linear(feat_dim, num_fabric)
-        self.head_wash_cycle = nn.Linear(feat_dim, num_wash)
+        self.head_color = nn.Linear(feat_dim, num_color)
+        self.head_fabric = nn.Linear(feat_dim, num_fabric)
+        self.head_wash_cycle = nn.Linear(feat_dim, num_wash)  # name matches checkpoint
 
     def forward(self, x):
         feat = self.backbone(x)
-        logits_color      = self.head_color(feat)
-        logits_fabric     = self.head_fabric(feat)
-        logits_wash_cycle = self.head_wash_cycle(feat)
-        return logits_color, logits_fabric, logits_wash_cycle
+        logits_color = self.head_color(feat)
+        logits_fabric = self.head_fabric(feat)
+        logits_wash = self.head_wash_cycle(feat)
+        return logits_color, logits_fabric, logits_wash
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 model = WashMultiTaskConvNeXt(
     num_color=num_color_classes,
     num_fabric=num_fabric_classes,
@@ -135,82 +131,52 @@ state_dict = torch.load(CKPT_PATH, map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
 
-print("[INFO] Model loaded successfully.")
+# --------------------------------------------------
+# 3) Preprocessing (بدون transforms.ToTensor)
+# --------------------------------------------------
+IMG_SIZE = 256
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def preprocess(pil_img: Image.Image) -> torch.Tensor:
+    pil_img = pil_img.convert("RGB")
+    pil_img = pil_img.resize((IMG_SIZE, IMG_SIZE))
+
+    x = np.array(pil_img).astype("float32") / 255.0  # [H, W, 3]
+    x = (x - IMAGENET_MEAN) / IMAGENET_STD
+    x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+    return x
+
 
 # --------------------------------------------------
-# 3) Prediction helper (single image)
+# 4) Single-image prediction helper
 # --------------------------------------------------
-
 def predict_single_image(pil_img: Image.Image):
-    """
-    Runs the multitask model on a single PIL image and returns:
-      - color  : predicted color group (or a fallback message)
-      - fabric : predicted fabric group (or a fallback message)
-      - wash   : human-readable wash-program description
-
-    A confidence-based rule is used to reject clearly non-clothing images:
-      * If both color and fabric confidences are very low, we assume the image
-        is not a garment and return an informative message instead of a program.
-    """
-    x = demo_transform(pil_img).unsqueeze(0).to(device)
+    x = preprocess(pil_img).to(device)
 
     with torch.no_grad():
         logits_c, logits_f, logits_w = model(x)
+        pc = logits_c.argmax(1).item()
+        pf = logits_f.argmax(1).item()
+        pw = logits_w.argmax(1).item()
 
-        # Softmax probabilities
-        probs_c = F.softmax(logits_c, dim=1)
-        probs_f = F.softmax(logits_f, dim=1)
-        probs_w = F.softmax(logits_w, dim=1)
-
-        max_pc, idx_c = probs_c.max(dim=1)
-        max_pf, idx_f = probs_f.max(dim=1)
-        max_pw, idx_w = probs_w.max(dim=1)
-
-        max_pc = max_pc.item()
-        max_pf = max_pf.item()
-        max_pw = max_pw.item()
-
-        # --------------------------------------------------
-        # Confidence-based non-garment / OOD check
-        # --------------------------------------------------
-        VERY_LOW_CONF = 0.30   # below this, we consider the head unreliable
-        LOW_CONF      = 0.55   # used only to tag low-confidence predictions
-
-        # Very low confidence on both color and fabric → likely not a garment
-        if (max_pc < VERY_LOW_CONF) and (max_pf < VERY_LOW_CONF):
-            return {
-                "color":  "No garment detected",
-                "fabric": "No garment detected",
-                "wash":   "No washing program suggested — the image does not appear to contain clothing.",
-            }
-
-        # For valid garments, we may still mark predictions as low-confidence
-        low_conf_flag = (min(max_pc, max_pf, max_pw) < LOW_CONF)
-
-    # If we are here, we treat the image as a valid garment
-    pc = idx_c.item()
-    pf = idx_f.item()
-    pw = idx_w.item()
-
-    wash_key = wash_map.get(pw, None)
-    if wash_key is None:
-        full_wash_text = "Wash program not defined for this class."
-    else:
-        full_wash_text = wash_full_description.get(wash_key, wash_key)
-
-    if low_conf_flag:
-        full_wash_text = "[Low confidence] " + full_wash_text
+    color_name = color_map.get(pc, f"class {pc}")
+    fabric_name = fabric_map.get(pf, f"class {pf}")
+    wash_key = wash_map.get(pw, f"class {pw}")
+    wash_text = wash_full_description.get(wash_key, str(wash_key))
 
     return {
-        "color":  color_map.get(pc, f"Unknown (id={pc})"),
-        "fabric": fabric_map.get(pf, f"Unknown (id={pf})"),
-        "wash":   full_wash_text,
+        "color": color_name,
+        "fabric": fabric_name,
+        "wash_key": wash_key,
+        "wash_text": wash_text,
     }
 
-# --------------------------------------------------
-# 4) Streamlit app
-# --------------------------------------------------
 
+# --------------------------------------------------
+# 5) Streamlit UI
+# --------------------------------------------------
 def main():
     st.set_page_config(
         page_title="AI Laundry Sorter",
@@ -222,47 +188,45 @@ def main():
         st.image(HEADER_IMG, use_container_width=True)
 
     st.title("AI Laundry Sorter")
-    st.caption("Deep-learning–powered recommender for color, fabric, and washing program.")
+    st.caption(
+        "Deep Learning–powered multi-task model that predicts color, fabric, "
+        "and the recommended washing program for each garment."
+    )
 
     uploaded_file = st.file_uploader(
-        "Upload a clothing image",
+        "Upload a clothing image (from your dataset or any new garment)",
         type=["jpg", "jpeg", "png"],
     )
 
-    if uploaded_file:
-        pil_img = Image.open(io.BytesIO(uploaded_file.read())).convert("RGB")
+    if uploaded_file is None:
+        st.info("Please upload a garment image to see the recommended wash settings.")
+        return
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Input Image")
-            st.image(pil_img, use_container_width=True)
+    # read image
+    pil_img = Image.open(io.BytesIO(uploaded_file.read())).convert("RGB")
 
-        result = predict_single_image(pil_img)
+    col1, col2 = st.columns(2)
 
-        with col2:
-            st.subheader("Recommended Settings")
-            st.markdown(f"**Color Group:** {result['color']}")
-            st.markdown(f"**Fabric Group:** {result['fabric']}")
-            st.markdown(f"**Wash Program:** {result['wash']}")
+    with col1:
+        st.subheader("Input garment")
+        st.image(pil_img, use_container_width=True)
 
-        # Log usage for reproducibility / analysis (optional)
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
-        row = pd.DataFrame([{
-            "timestamp": ts,
-            "image": uploaded_file.name,
-            "color": result["color"],
-            "fabric": result["fabric"],
-            "wash": result["wash"],
-        }])
-        if os.path.exists(DEMO_LOG):
-            old = pd.read_csv(DEMO_LOG)
-            pd.concat([old, row], ignore_index=True).to_csv(DEMO_LOG, index=False)
-        else:
-            row.to_csv(DEMO_LOG, index=False)
+    # prediction
+    result = predict_single_image(pil_img)
 
-        st.success("Prediction logged.")
-    else:
-        st.info("Upload a garment image to receive washing instructions.")
+    with col2:
+        st.subheader("Recommended settings")
+        st.markdown(f"**Color group:** {result['color']}")
+        st.markdown(f"**Fabric group:** {result['fabric']}")
+        st.markdown(f"**Wash program:** {result['wash_text']}")
+
+    # Optional simple log (no need برای پروژه هم خیلی خوبه)
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    st.caption(
+        f"Prediction generated at {ts}. "
+        "Model: ConvNeXt-tiny multi-task classifier (color, fabric, wash cycle)."
+    )
+
 
 if __name__ == "__main__":
     main()
